@@ -8,11 +8,11 @@ WORKDIR /app
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Copy project
-COPY pyproject.toml .
+COPY pyproject.toml uv.lock .
 COPY kenyan_news/ kenyan_news/
 
 # Install dependencies (no playwright — API doesn't crawl)
-RUN uv sync --no-dev --group server --frozen
+RUN uv sync --no-dev --extra server --frozen
 
 EXPOSE 8090
 
