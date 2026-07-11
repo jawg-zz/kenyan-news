@@ -316,6 +316,24 @@ def _tg_send(chat_id: int, text: str, parse_mode: str = "HTML"):
         return {"ok": False, "error": str(e)}
 
 
+def _tg_send_photo(chat_id: int, photo_url: str, caption: str = ""):
+    """Send a photo with caption via Telegram Bot API."""
+    token = os.environ.get("TELEGRAM_NEWS_BOT_TOKEN", "")
+    if not token or not photo_url:
+        return {"ok": False}
+    import httpx
+    try:
+        resp = httpx.post(
+            f"{TELEGRAM_API}{token}/sendPhoto",
+            json={"chat_id": chat_id, "photo": photo_url, "caption": caption,
+                  "parse_mode": "HTML"},
+            timeout=15,
+        )
+        return resp.json()
+    except Exception:
+        return {"ok": False}
+
+
 def _clean_title(title: str) -> str:
     """Strip whitespace/newline artifacts from scraped titles."""
     import re
@@ -347,7 +365,8 @@ def _format_articles(articles: list, max_show: int = 8) -> str:
             continue
         src = _tg_escape(a["source_name"])
         url = a["url"]
-        parts.append(f'{i+1}. <a href="{url}">{_tg_escape(title)}</a>\n   <i>{src}</i>')
+        img = " 📷" if a.get("top_image") else ""
+        parts.append(f'{i+1}. <a href="{url}">{_tg_escape(title)}</a>{img}\n   <i>{src}</i>')
     return "\n\n".join(parts)
 
 
@@ -437,6 +456,13 @@ async def telegram_webhook(payload: dict):
             else:
                 body = _format_articles(articles, max_show=8)
                 reply = f"📋 <b>Latest Headlines</b>\n\n{body}\n\n<i>Tap a headline to read the full article</i>"
+                # Send lead image as photo first if available
+                lead_img = articles[0].get("top_image", "")
+                if lead_img and lead_img.startswith("http"):
+                    lead_title = _clean_title(articles[0]["title"])
+                    _tg_send_photo(chat_id, lead_img, f"<b>{_tg_escape(lead_title)}</b>")
+                else:
+                    lead_img = None
 
         elif command == "/search" and query:
             results = db.search_articles(conn, query, limit=8)
@@ -445,6 +471,10 @@ async def telegram_webhook(payload: dict):
             else:
                 body = _format_articles(results, max_show=8)
                 reply = f'🔍 <b>Search: "{_tg_escape(query)}"</b>\n\n{body}'
+                # Send lead image
+                lead_img = results[0].get("top_image", "")
+                if lead_img and lead_img.startswith("http"):
+                    _tg_send_photo(chat_id, lead_img, f"🔍 <b>\"{_tg_escape(query)}\"</b>")
 
         elif command == "/search" and not query:
             reply = "/search &lt;query&gt; — e.g. /search accident"
