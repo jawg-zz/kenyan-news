@@ -298,7 +298,7 @@ from datetime import datetime, timezone
 TELEGRAM_API = "https://api.telegram.org/bot"
 
 
-def _tg_send(chat_id: int, text: str, parse_mode: str = "Markdown"):
+def _tg_send(chat_id: int, text: str, parse_mode: str = "HTML"):
     """Send a message via Telegram Bot API."""
     token = os.environ.get("TELEGRAM_NEWS_BOT_TOKEN", "")
     if not token:
@@ -314,6 +314,41 @@ def _tg_send(chat_id: int, text: str, parse_mode: str = "Markdown"):
         return resp.json()
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+def _clean_title(title: str) -> str:
+    """Strip whitespace/newline artifacts from scraped titles."""
+    import re
+    # Remove leading numbers/dates like "6 hours ago   "
+    cleaned = re.sub(r'^\s*\d+\s*(hours?|minutes?|days?|seconds?)\s+ago\s*', '', title, flags=re.IGNORECASE)
+    # Remove "By ReporterName" suffixes
+    cleaned = re.sub(r'\s+By\s+\w+(\s+\w+)*\s*$', '', cleaned)
+    # Remove "News" / "Sports" / "Business" section headers
+    cleaned = re.sub(r'^(News|Sports|Business|Politics|Entertainment|Video)\s*[•\-]\s*', '', cleaned, flags=re.IGNORECASE)
+    # Collapse all whitespace (including \n) into single spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    # Truncate to reasonable length
+    if len(cleaned) > 100:
+        cleaned = cleaned[:97] + "..."
+    return cleaned
+
+
+def _tg_escape(text: str) -> str:
+    """Escape HTML special characters for Telegram."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _format_articles(articles: list, max_show: int = 8) -> str:
+    """Format article list as HTML for Telegram."""
+    parts = []
+    for i, a in enumerate(articles[:max_show]):
+        title = _clean_title(a["title"])
+        if not title:
+            continue
+        src = _tg_escape(a["source_name"])
+        url = a["url"]
+        parts.append(f'{i+1}. <a href="{url}">{_tg_escape(title)}</a>\n   <i>{src}</i>')
+    return "\n\n".join(parts)
 
 
 def _tg_briefing() -> str:
@@ -332,7 +367,7 @@ def _tg_briefing() -> str:
     sources_ok = sum(1 for h in health if h['successes'] > 0) if health else 0
     sources_total = len(set(h['name'] for h in health)) if health else 0
 
-    lines = [f"📰 *Kenyan News Briefing* — {now}", ""]
+    lines = [f"📰 <b>Kenyan News Briefing</b> — {now}", ""]
     if total == 0:
         lines.append("No new articles in the last 24h.")
         return "\n".join(lines)
@@ -341,18 +376,20 @@ def _tg_briefing() -> str:
     lines.append("")
 
     if stories:
-        lines.append(f"🔗 *Top Stories* ({len(stories)}):")
+        lines.append(f"🔗 <b>Top Stories</b> ({len(stories)}):")
         for s in stories[:5]:
+            title = _clean_title(s["title"])
             src_list = ", ".join(set(a["source_name"] for a in s["articles"]))
-            lines.append(f"• {s['title']}")
-            lines.append(f"  _{s['article_count']} articles from {src_list}_")
+            lines.append(f"• {_tg_escape(title)}")
+            lines.append(f"  <i>{s['article_count']} articles from {src_list}</i>")
             for a in s["articles"][:2]:
-                lines.append(f"  [{a['source_name']}]({a['url']})")
+                lines.append(f"  → <a href=\"{a['url']}\">{_tg_escape(a['source_name'])}</a>")
 
     lines.append("")
-    lines.append("*Latest headlines:*")
+    lines.append("<b>Latest headlines:</b>")
     for a in articles[:8]:
-        lines.append(f"• [{a['source_name']}] {a['title']}")
+        title = _clean_title(a["title"])
+        lines.append(f"• <a href=\"{a['url']}\">{_tg_escape(title)}</a>  <i>[{_tg_escape(a['source_name'])}]</i>")
 
     return "\n".join(lines)
 
@@ -383,14 +420,14 @@ async def telegram_webhook(payload: dict):
     try:
         if command == "/start" or command == "/help":
             reply = (
-                "📰 *Kenyan News Bot*\n\n"
+                "📰 <b>Kenyan News Bot</b>\n\n"
                 "Commands:\n"
-                "`/news` — Latest headlines\n"
-                "`/search <query>` — Search articles\n"
-                "`/stories` — Top story clusters\n"
-                "`/briefing` — 24h briefing\n"
-                "`/health` — Source status\n"
-                "`/help` — This message"
+                "/news — Latest headlines\n"
+                "/search &lt;query&gt; — Search articles\n"
+                "/stories — Top story clusters\n"
+                "/briefing — 24h briefing\n"
+                "/health — Source status\n"
+                "/help — This message"
             )
 
         elif command == "/news":
@@ -398,38 +435,36 @@ async def telegram_webhook(payload: dict):
             if not articles:
                 reply = "No articles yet. Run a crawl first."
             else:
-                lines = ["📋 *Latest Headlines*", ""]
-                for a in articles:
-                    title = a["title"].strip().split("\n")[0][:80]
-                    lines.append(f"• [{a['source_name']}] {title}")
-                reply = "\n".join(lines)
+                body = _format_articles(articles, max_show=8)
+                reply = f"📋 <b>Latest Headlines</b>\n\n{body}\n\n<i>Tap a headline to read the full article</i>"
 
         elif command == "/search" and query:
             results = db.search_articles(conn, query, limit=8)
             if not results:
-                reply = f"Nothing found for \"{query}\"."
+                reply = f'Nothing found for "<i>{_tg_escape(query)}</i>".'
             else:
-                lines = [f"🔍 *Search: \"{query}\"*", ""]
-                for a in results:
-                    title = a["title"].strip().split("\n")[0][:80]
-                    lines.append(f"• [{a['source_name']}] {title}")
-                    lines.append(f"  {a['url']}")
-                reply = "\n".join(lines)
+                body = _format_articles(results, max_show=8)
+                reply = f'🔍 <b>Search: "{_tg_escape(query)}"</b>\n\n{body}'
 
         elif command == "/search" and not query:
-            reply = "Usage: `/search <query>` — e.g. `/search accident`"
+            reply = "/search &lt;query&gt; — e.g. /search accident"
 
         elif command == "/stories":
             stories = db.get_stories(conn, limit=8, min_articles=2)
             if not stories:
                 reply = "No multi-source stories yet. Need more crawl cycles."
             else:
-                lines = ["🔗 *Top Stories*", ""]
+                parts = []
                 for s in stories:
                     src_list = ", ".join(set(a["source_name"] for a in s["articles"]))
-                    lines.append(f"• {s['title']}")
-                    lines.append(f"  _{s['article_count']} articles from {src_list}_")
-                reply = "\n".join(lines)
+                    title = _clean_title(s["title"])
+                    parts.append(f"🔗 <b>{_tg_escape(title)}</b>\n"
+                                 f"<i>{s['article_count']} articles from {src_list}</i>")
+                    for a in s["articles"][:2]:
+                        url = a["url"]
+                        src = _tg_escape(a["source_name"])
+                        parts.append(f"  → <a href=\"{url}\">{src}</a>")
+                reply = "\n\n".join(parts)
 
         elif command == "/briefing":
             reply = _tg_briefing()
@@ -439,11 +474,11 @@ async def telegram_webhook(payload: dict):
             if not health:
                 reply = "No health data yet."
             else:
-                lines = ["📊 *Source Health*", ""]
+                lines = ["📊 <b>Source Health</b>", ""]
                 for h in health:
                     status = "✅" if h['failures'] == 0 else "⚠️"
                     lat = f"{h['avg_latency']:.1f}s" if h['avg_latency'] else "-"
-                    lines.append(f"{status} *{h['name']}*: {h['successes']} OK, {h['failures']} fail, {lat}")
+                    lines.append(f"{status} <b>{_tg_escape(h['name'])}</b>: {h['successes']} OK, {h['failures']} fail, {lat}")
                 reply = "\n".join(lines)
 
         else:
