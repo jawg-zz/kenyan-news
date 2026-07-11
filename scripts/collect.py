@@ -48,6 +48,34 @@ def main():
     finally:
         conn.close()
 
+    # Sync DB to remote API server (best-effort)
+    _sync_db()
+
+
+def _sync_db():
+    """Upload the local SQLite DB to the news API server."""
+    import subprocess, httpx
+    db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "news.db")
+    if not os.path.exists(db_path):
+        return
+    try:
+        with open(db_path, "rb") as f:
+            data = f.read()
+        resp = httpx.post(
+            "https://news-api.spidmax.win/api/upload-db",
+            content=data,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            j = resp.json()
+            if j.get("ok"):
+                os.environ.setdefault("_news_sync_ok", "1")  # no-op, just for flag
+        else:
+            print(f"  ⚠️  DB sync failed: {resp.status_code}")
+    except Exception as e:
+        print(f"  ⚠️  DB sync error: {e}")
+
 
 if __name__ == "__main__":
     main()
