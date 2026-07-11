@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: kenyan-news
+Version: 2.0.0
+Summary: Kenyan news aggregator — multi-source crawling, dedup, breaking news alerts
+Requires-Python: >=3.12
+Requires-Dist: newspaper4k>=0.9.3
+Requires-Dist: lxml_html_clean>=0.4
+Requires-Dist: pillow>=10
+Requires-Dist: playwright>=1.50
+Requires-Dist: feedparser>=6.0
+Requires-Dist: httpx>=0.28
+Provides-Extra: server
+Requires-Dist: fastapi>=0.115; extra == "server"
+Requires-Dist: uvicorn>=0.34; extra == "server"

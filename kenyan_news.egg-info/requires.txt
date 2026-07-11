@@ -1,0 +1,10 @@
+newspaper4k>=0.9.3
+lxml_html_clean>=0.4
+pillow>=10
+playwright>=1.50
+feedparser>=6.0
+httpx>=0.28
+
+[server]
+fastapi>=0.115
+uvicorn>=0.34

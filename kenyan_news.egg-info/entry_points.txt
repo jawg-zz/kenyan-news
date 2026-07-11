@@ -1,0 +1,2 @@
+[console_scripts]
+kenyan-news = kenyan_news.__main__:main
