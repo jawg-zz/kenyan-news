@@ -16,6 +16,15 @@ CHROME_PATH = "/opt/hermes/.playwright/chromium-1228/chrome-linux/chrome"
 
 # ─── Supported sources ───────────────────────────────────────────────
 
+# ─── Google News RSS (primary source) ───────────────────────────────
+
+GOOGLE_NEWS = {
+    "url": "https://news.google.com/rss/search?q=kenya&hl=en-KE&gl=KE&ceid=KE:en",
+    "mode": "google-news",
+}
+
+# ─── Site-specific scrapers (fallbacks) ─────────────────────────────
+
 SOURCES = {
     "kenyans": {
         "url": "https://www.kenyans.co.ke/news",
@@ -130,6 +139,68 @@ def fetch_rss(rss_url: str) -> list[dict]:
             "top_image": top_image,
             "published": entry.get("published", ""),
         })
+    return articles
+
+
+@retry(max_attempts=2, delay=2)
+def fetch_google_news() -> list[dict]:
+    """Fetch headlines from Google News RSS (covers ALL Kenyan outlets)."""
+    import feedparser
+
+    url = "https://news.google.com/rss/search?q=kenya&hl=en-KE&gl=KE&ceid=KE:en"
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    resp = httpx.get(url, headers=headers, timeout=15, follow_redirects=True)
+    resp.raise_for_status()
+    feed = feedparser.parse(resp.text)
+
+    # Known Kenyan outlet domains for source filtering
+    kenyan_domains = {
+        "nation.africa", "the-star.co.ke", "standardmedia.co.ke", "citizen.digital",
+        "kenyans.co.ke", "tuko.co.ke", "capitalfm.africa", "ntvkenya.co.ke",
+        "kbc.co.ke", "businessdailyafrica.com", "theeastafrican.co.ke",
+    }
+
+    articles = []
+    seen_urls = set()
+    for entry in feed.entries:
+        title = (entry.get("title") or "").strip()
+        link = (entry.get("link") or "").strip()
+        if not title or not link or link in seen_urls:
+            continue
+
+        # Get source name from RSS source tag
+        src_tag = entry.get("source", {}) if hasattr(entry, "source") else {}
+        source_name = (src_tag.get("title") or "").strip() if isinstance(src_tag, dict) else ""
+
+        # Filter: only Kenyan outlets or general Kenya news
+        is_kenyan = any(d in link.lower() for d in kenyan_domains)
+        is_kenyan = is_kenyan or any(k in title.lower() for k in ("kenya", "kenyan", "nairobi", "ruto"))
+
+        if not is_kenyan and source_name and "kenya" not in source_name.lower():
+            continue
+
+        seen_urls.add(link)
+
+        # Extract image from media:content, media:thumbnail, or enclosure
+        top_image = ""
+        if hasattr(entry, "media_content") and entry.media_content:
+            top_image = entry.media_content[0].get("url", "")
+        elif hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
+            top_image = entry.media_thumbnail[0].get("url", "")
+        elif hasattr(entry, "enclosures") and entry.enclosures:
+            top_image = entry.enclosures[0].get("href", "")
+
+        articles.append({
+            "title": title,
+            "url": link,
+            "top_image": top_image,
+            "source_name": source_name or "Google News",
+            "published": entry.get("published", ""),
+        })
+
+        if len(articles) >= 25:
+            break
+
     return articles
 
 
@@ -354,14 +425,106 @@ def crawl_source(conn, source_name: str) -> dict:
         log.error("%s failed: %s", source_name, err)
         db.finish_crawl(conn, event_id, 0, 0, success=False, error_msg=err)
         db.record_health(conn, src_id, success=False, latency=latency, articles_found=0)
+        db.commit()
+        return {"source": source_name, "found": 0, "new": 0, "success": False, "error": err}
+
+
+def crawl_google_news(conn) -> dict:
+    """Fetch Google News RSS and persist articles. Replaces all individual scrapers."""
+    source_name = "google-news"
+    url = "https://news.google.com/rss/search?q=kenya&hl=en-KE&gl=KE&ceid=KE:en"
+    mode = "google-news"
+
+    src_id = db.get_or_create_source(conn, source_name, url, mode)
+    event_id = db.start_crawl(conn, source_id=src_id)
+    t0 = time.time()
+
+    try:
+        articles = fetch_google_news()
+        latency = time.time() - t0
+        new_count = 0
+
+        for a in articles:
+            src = a.get("source_name", "") or source_name
+            # Map source to a consistent name for source_id lookup
+            mapped_name = _map_source_name(src)
+            mapped_id = db.get_or_create_source(conn, mapped_name, url, "google-news")
+
+            art_id, is_new = db.upsert_article(
+                conn, mapped_id, a["url"], a["title"],
+                top_image=a.get("top_image", ""),
+                published=a.get("published", ""),
+            )
+            if is_new:
+                new_count += 1
+            db.find_or_create_story(conn, art_id, a["title"], a.get("top_image", ""))
+
+            # Fetch full text for breaking-scored articles
+            if is_new and len(a.get("title", "")) > 15:
+                urgency = breaking.score_article(a["title"], src)
+                if urgency >= 4:
+                    try:
+                        content = fetch_article(a["url"])
+                        text = content.get("text", "")
+                        if text and len(text) > 200 and not content.get("paywalled"):
+                            conn.execute(
+                                "UPDATE articles SET text=?, text_fetched=1 WHERE id=?",
+                                (text[:50000], art_id),
+                            )
+                    except Exception:
+                        pass
+
+        db.finish_crawl(conn, event_id, len(articles), new_count, success=True)
+        db.record_health(conn, src_id, success=True, latency=latency, articles_found=len(articles))
+        conn.commit()
+
+        log.info("%s: %d articles, %d new (%.1fs)", source_name, len(articles), new_count, latency)
+        return {"source": source_name, "found": len(articles), "new": new_count, "success": True}
+
+    except Exception as e:
+        latency = time.time() - t0
+        err = str(e)
+        log.error("%s failed: %s", source_name, err)
+        db.finish_crawl(conn, event_id, 0, 0, success=False, error_msg=err)
+        db.record_health(conn, src_id, success=False, latency=latency, articles_found=0)
         conn.commit()
         return {"source": source_name, "found": 0, "new": 0, "success": False, "error": err}
 
 
+def _map_source_name(raw: str) -> str:
+    """Map Google News source names to consistent slug."""
+    mapping = {
+        "daily nation": "nation",
+        "nation.africa": "nation",
+        "the star": "the-star",
+        "the-star.co.ke": "the-star",
+        "standard media": "standard",
+        "standardmedia.co.ke": "standard",
+        "citizen digital": "citizen",
+        "kenyans.co.ke": "kenyans",
+        "tuko.co.ke": "tuko",
+        "capital fm": "capitalfm",
+        "capitalfm.africa": "capitalfm",
+        "ntv": "ntv",
+        "kbc": "kbc",
+        "business daily": "business-daily",
+        "the east african": "east-african",
+    }
+    key = raw.lower().strip()
+    return mapping.get(key, raw.lower().replace(" ", "-")[:20])
+
+
 def crawl_all(conn, sources: list[str] | None = None) -> list[dict]:
-    """Crawl specified sources (or all available)."""
-    all_sources = list(SOURCES.keys()) + list(RSS_SOURCES.keys())
-    targets = sources or all_sources
+    """Crawl specified sources (or all available).
+
+    Default behaviour: fetch Google News RSS (covers all Kenyan outlets in one call, ~0.5s).
+    Pass specific source names to fall back to individual site scrapers (Playwright, ~90s total).
+    """
+    # Google News is the default primary source
+    if sources is None:
+        return [crawl_google_news(conn)]
+
+    targets = sources
     results = []
     for name in targets:
         results.append(crawl_source(conn, name))

@@ -209,8 +209,9 @@ def cmd_briefing(conn, since_hours: int = 24, md: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(description="Kenyan News Aggregator v2")
-    parser.add_argument("--site", choices=list(scraper.SOURCES.keys()) + list(scraper.RSS_SOURCES.keys()) + ["all"],
-                        default=["all"], nargs="+", help="Source(s) to crawl, or 'all'")
+    parser.add_argument("--site", choices=list(scraper.SOURCES.keys()) + ["google-news", "all"],
+                        default=["all"], nargs="+", help="Source(s). Default: google-news (0.5s, all outlets)")
+    parser.add_argument("--fallback", action="store_true", help="Also run site-specific Playwright scrapers (slow, ~90s)")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--collect", action="store_true", help="Crawl + persist to SQLite + check breaking news")
     parser.add_argument("--stories", action="store_true", help="Show deduped stories")
@@ -238,13 +239,19 @@ def main():
 
     # Determine which sites
     if "all" in args.site:
-        sites = list(scraper.SOURCES.keys()) + list(scraper.RSS_SOURCES.keys())
+        # Default: Google News RSS (0.5s, covers all outlets)
+        sites = None
     else:
         sites = args.site
 
     try:
         if args.collect:
             cmd_collect(conn, sites)
+            if args.fallback:
+                # Also run individual Playwright scrapers
+                fb_sites = list(scraper.SOURCES.keys())
+                print("\n  ── Fallback scrapers ──")
+                scraper.crawl_all(conn, sources=fb_sites)
         elif args.stories:
             cmd_stories(conn)
         elif args.search:
